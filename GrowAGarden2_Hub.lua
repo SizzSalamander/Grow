@@ -89,14 +89,12 @@ local autoSellFullEnabled     = false
 local autoSellIntervalEnabled = false
 local antiAfkEnabled     = false
 local infJumpEnabled     = false
-local walkFlingEnabled   = false
-local walkSpeed          = 16
-local infJumpConn        = nil
-local walkFlingConns     = {}
-local walkFlingConn      = nil
-local walkFlingCooldowns = {}
-local WALK_FLING_POWER   = 650
-local WALK_FLING_COOLDOWN = 0.35
+local walkFlingEnabled      = false
+local walkSpeed             = 16
+local infJumpConn           = nil
+local walkFlingLoopActive   = false
+local walkFlingNoclipConn   = nil
+local walkFlingDiedConn     = nil
 
 local SEED_BUY_COOLDOWN  = 0.03
 local SEED_BUY_DELAY     = 0.005
@@ -112,7 +110,7 @@ local autoSellIntervalSecs = 60
 
 -- UI refs populated during build
 local shecklesLbl, sellStatusLbl, harvestStatusLbl, growStatusLbl, gardenStatusLbl
-local stealStatusLbl, seedStatusLbl, gearStatusLbl, speedLbl
+local stealStatusLbl, seedStatusLbl, gearStatusLbl, speedLbl, walkFlingBtn
 
 -- ================================================
 -- HELPERS
@@ -321,77 +319,52 @@ local function tryStealOnce()
     return true, "Stole 1 plant"
 end
 
-local function getPlayerFromPart(part)
-    if not part then return nil, nil end
-    local model = part:FindFirstAncestorOfClass("Model")
-    if not model then return nil, nil end
-    if not model:FindFirstChildOfClass("Humanoid") then return nil, nil end
-    local player = Players:GetPlayerFromCharacter(model)
-    return player, model
-end
-
-local function flingOtherCharacter(targetChar, sourceHRP)
-    local targetHRP = targetChar:FindFirstChild("HumanoidRootPart")
-    local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
-    if not targetHRP or not targetHum or targetHum.Health <= 0 then return end
-
-    local offset = targetHRP.Position - sourceHRP.Position
-    local direction = offset.Magnitude > 0.01 and offset.Unit or sourceHRP.CFrame.LookVector
-    local launch = direction * WALK_FLING_POWER + Vector3.new(0, WALK_FLING_POWER * 0.55, 0)
-
-    targetHRP.AssemblyLinearVelocity = launch
-    targetHRP.AssemblyAngularVelocity = Vector3.new(
-        math.random(-30, 30) * 20,
-        math.random(-30, 30) * 20,
-        math.random(-30, 30) * 20
-    )
-end
-
-local function tryFlingTouch(hit)
-    if not walkFlingEnabled or not hit then return end
-
-    local otherPlayer, otherChar = getPlayerFromPart(hit)
-    if not otherPlayer or otherPlayer == lp then return end
-
-    local now = tick()
-    local last = walkFlingCooldowns[otherPlayer.UserId]
-    if last and (now - last) < WALK_FLING_COOLDOWN then return end
-    walkFlingCooldowns[otherPlayer.UserId] = now
-
-    local myChar = lp.Character
-    local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
-    if not myHRP then return end
-
-    flingOtherCharacter(otherChar, myHRP)
-end
-
-local function bindWalkFlingPart(part)
-    if not part:IsA("BasePart") then return end
-    local conn = part.Touched:Connect(function(hit)
-        tryFlingTouch(hit)
-    end)
-    table.insert(walkFlingConns, conn)
-end
-
-local function bindWalkFlingCharacter(char)
-    for _, desc in ipairs(char:GetDescendants()) do
-        bindWalkFlingPart(desc)
+local function getRoot(char)
+    if char and char:FindFirstChildOfClass("Humanoid") then
+        return char:FindFirstChildOfClass("Humanoid").RootPart
     end
-    table.insert(walkFlingConns, char.DescendantAdded:Connect(function(desc)
-        bindWalkFlingPart(desc)
-    end))
+    return nil
+end
+
+local function setWalkFlingButtonState(enabled)
+    if not walkFlingBtn then return end
+    walkFlingBtn.Text = enabled and "Walk Fling: ON" or "Walk Fling: OFF"
+    walkFlingBtn.BackgroundColor3 = enabled
+        and Color3.fromRGB(160, 50, 50)
+        or Color3.fromRGB(90, 35, 35)
+end
+
+local function startWalkFlingNoclip()
+    if walkFlingNoclipConn then
+        walkFlingNoclipConn:Disconnect()
+        walkFlingNoclipConn = nil
+    end
+    walkFlingNoclipConn = RunService.Stepped:Connect(function()
+        if not walkFlingLoopActive then return end
+        local char = lp.Character
+        if not char then return end
+        for _, child in ipairs(char:GetDescendants()) do
+            if child:IsA("BasePart") and child.CanCollide then
+                child.CanCollide = false
+            end
+        end
+    end)
+end
+
+local function stopWalkFlingNoclip()
+    if walkFlingNoclipConn then
+        walkFlingNoclipConn:Disconnect()
+        walkFlingNoclipConn = nil
+    end
 end
 
 local function stopWalkFling()
-    if walkFlingConn then
-        walkFlingConn:Disconnect()
-        walkFlingConn = nil
+    walkFlingLoopActive = false
+    stopWalkFlingNoclip()
+    if walkFlingDiedConn then
+        walkFlingDiedConn:Disconnect()
+        walkFlingDiedConn = nil
     end
-    for _, conn in ipairs(walkFlingConns) do
-        conn:Disconnect()
-    end
-    table.clear(walkFlingConns)
-    table.clear(walkFlingCooldowns)
 end
 
 local function startWalkFling()
@@ -400,19 +373,51 @@ local function startWalkFling()
 
     local char = lp.Character
     if not char then return end
-    bindWalkFlingCharacter(char)
 
-    walkFlingConn = RunService.Heartbeat:Connect(function()
-        if not walkFlingEnabled then return end
-        local c = lp.Character
-        if not c then return end
-        for _, part in ipairs(c:GetDescendants()) do
-            if part:IsA("BasePart") then
-                for _, hit in ipairs(part:GetTouchingParts()) do
-                    tryFlingTouch(hit)
-                end
+    local humanoid = char:FindFirstChildWhichIsA("Humanoid")
+    if humanoid then
+        walkFlingDiedConn = humanoid.Died:Connect(function()
+            walkFlingEnabled = false
+            setWalkFlingButtonState(false)
+            stopWalkFling()
+        end)
+    end
+
+    startWalkFlingNoclip()
+    walkFlingLoopActive = true
+
+    task.spawn(function()
+        repeat
+            RunService.Heartbeat:Wait()
+            if not walkFlingLoopActive then break end
+
+            local character = lp.Character
+            local root = getRoot(character)
+            local vel, movel = nil, 0.1
+
+            while not (character and character.Parent and root and root.Parent) do
+                if not walkFlingLoopActive then return end
+                RunService.Heartbeat:Wait()
+                character = lp.Character
+                root = getRoot(character)
             end
-        end
+
+            vel = root.Velocity
+            root.Velocity = vel * 10000 + Vector3.new(0, 10000, 0)
+
+            RunService.RenderStepped:Wait()
+            if not walkFlingLoopActive then return end
+            if character and character.Parent and root and root.Parent then
+                root.Velocity = vel
+            end
+
+            RunService.Stepped:Wait()
+            if not walkFlingLoopActive then return end
+            if character and character.Parent and root and root.Parent then
+                root.Velocity = vel + Vector3.new(0, movel, 0)
+                movel = movel * -1
+            end
+        until not walkFlingLoopActive
     end)
 end
 
@@ -981,10 +986,10 @@ do
     y += 24
     y = mkDivider(y, c)
 
-    y = mkSection("FLING MODE", y, c)
-    mkLabel("Toggle to fling any player who touches your character. You move normally.", y, 36, nil, c)
+    y = mkSection("WALK FLING", y, c)
+    mkLabel("Infinite Yield walkfling. Fling players on touch without spinning.", y, 36, nil, c)
     y += 38
-    local walkFlingBtn = mkBtn("Fling Mode: OFF", y, c, Color3.fromRGB(90, 35, 35), Color3.fromRGB(255, 180, 180))
+    walkFlingBtn = mkBtn("Walk Fling: OFF", y, c, Color3.fromRGB(90, 35, 35), Color3.fromRGB(255, 180, 180))
     y += 40
 
     resizeTab("PvP", y + 10)
@@ -1002,8 +1007,7 @@ do
 
     walkFlingBtn.MouseButton1Click:Connect(function()
         walkFlingEnabled = not walkFlingEnabled
-        walkFlingBtn.Text = walkFlingEnabled and "Fling Mode: ON" or "Fling Mode: OFF"
-        walkFlingBtn.BackgroundColor3 = walkFlingEnabled and Color3.fromRGB(160, 50, 50) or Color3.fromRGB(90, 35, 35)
+        setWalkFlingButtonState(walkFlingEnabled)
         if walkFlingEnabled then
             startWalkFling()
         else
